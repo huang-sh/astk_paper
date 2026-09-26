@@ -1,0 +1,114 @@
+n" and europe.get("authorString"):
+            result.first_author = str(europe["authorString"]).split(",")[0].split()[-1]
+        if not result.journal:
+            result.journal = europe.get("journalTitle") or ""
+        if not result.metadata_source:
+            result.metadata_source = "Europe PMC"
+            result.match_score = round(title_similarity(title, europe.get("title") or ""), 4)
+
+    candidates, is_oa, oa_status, oa_landing = openalex_candidates(openalex)
+    epmc_candidates, pmcid, epmc_landing = europepmc_candidates(europe)
+    candidates.extend(c for c in epmc_candidates if c not in candidates)
+    known_oa = is_oa or bool(epmc_candidates)
+    candidates.extend(c for c in crossref_oa_candidates(crossref, known_oa) if c not in candidates)
+    result.open_access = known_oa
+    result.oa_status = oa_status or ("repository" if pmcid else "")
+    if oa_landing:
+        result.landing_url = oa_landing
+    elif epmc_landing:
+        result.landing_url = epmc_landing
+    elif result.doi and not result.landing_url:
+        result.landing_url = f"https://doi.org/{result.doi}"
+
+    if candidates:
+        year_text = str(result.resolved_year or year or "n.d.")
+        short_title = safe_filename(result.resolved_title or title, 78)
+        author = safe_filename(result.first_author or "Unknown", 25)
+        filename = f"{ref_id:03d}_{author'}_{year_text}_{short_title}.pdf"
+        destination = output_dir / "pdfs" / result.category / filename
+        ok, used_url, source_or_error = download_pdf(client, candidates, destination)
+        if ok:
+            result.status = "downloaded"
+            result.pdf_url = used_url
+            result.pdf_filename = str(destination.relative_to(output_dir))
+            result.note = source_or_error
+        else:
+            result.status = "oa_link_found_download_failed"
+            result.note = source_or_error or "Open-access location found but PDF download failed"
+    else:
+        result.status = "not_open_access_or_no_pdf_found"
+        result.note = "No verified open-access PDF Location was found in OpenAlex or Europe PMC"
+
+    if not result.doi:
+        result.note = (result.note + ";DOI unresolved").strip("; ")
+    return result
+
+
+def write_outputs(output_dir: Path, resolutions: list[Resolution]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    fields = list(asdict(resolutions[0]).keys()) if resolutions else []
+    with (output_dir / "all_references_resolved.csv").open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(asdict(item) for item in resolutions)
+
+    unavailable = [item for item in resolutions if item.status != "downloaded"]
+    with (output_dir / "unavailable_title_doi.csv").open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["id", "title", "doi", "status", "reason", "landing_url"])
+        for item in unavailable:
+            writer.writerow([
+                item.id,
+                item.resolved_title or item.requested_title,
+                item.doi or "DOI not resolved",
+                item.status,
+                item.note,
+                item.landing_url,
+            ])
+
+    with (output_dir / "resolved_metadata.json").open("w", encoding="utf-8") as handle:
+        json.dump([asdict(item) for item in resolutions], handle, ensure_ascii=False, indent=2)
+
+    downloaded = [item for item in resolutions if item.status == "downloaded"]
+    lines = [
+        "# PhD Part I literature bundle",
+        "",
+        f"- Requested references: **{len(resolutions)}**",
+        f"- Open-access PDFs downloaded: **{len(downloaded)}**",
+        f"- Not downloaded: **{len(unavailable)}**",
+        "",
+        "This bundle was generated from public scholarly metadata and open-access full-text locations.",
+        "The workflow does **not** bypass paywalls, authentication, access controls, or publisher restrictions.",
+        "For every item not downloaded, `unavailable_title_doi.csv` provides the title, DOI when resolved,",
+        "status, reason, and landing page.",
+        "",
+        "## Contents",
+        "",
+        "- `pdfs/`: downloaded PDFs grouped by thesis topic.",
+        "- `all_references_resolved.csv`: all references and resolution/download metadata.",
+        "- `unavailable_title_doi.csv`: requested title and DOI for items without a downloaded PDF.",
+        "- `resolved_metadata.json`: machine-readable metadata.",
+        "- `download_log.txt`: progress and diagnostic log.",
+        "",
+        "## Downloaded papers",
+        "",
+    ]
+    for item in downloaded:
+        lines.append(f"- {item.id}. {item.resolved_title} — DOI: {item.doi or 'not resolved'} — `{item.pdf_filename}`")
+    lines.extend(["", "## Not downloaded", ""])
+    for item in unavailable:
+        lines.append(f"- {item.id}. {item.resolved_title or item.requested_title} — DOI: {item.doi or 'not resolved'} — {item.status}")
+    (output_dir / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True)
+    parser.add_argument("--output", required=True)
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    output_dir = Path(args.output)
+    refs = json.loads(input_path.read_text(encoding="utf-8"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+   

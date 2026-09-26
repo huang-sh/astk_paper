@@ -1,0 +1,37 @@
+ log_path = output_dir / "download_log.txt"
+
+    client = HTTPClient()
+    resolutions: list[Resolution] = []
+    with log_path.open("w", encoding="utf-8", buffering=1) as log:
+        def emit(message: str) -> None:
+            print(message, flush=True)
+            log.write(message + "\n")
+
+        emit(f"Starting resolution for {len(refs)} references")
+        for pos, ref in enumerate(refs, 1):
+            emit(f"[{pos}/{len(refs)}] {ref['id']}: {ref['title']}")
+            try:
+                resolved = resolve_one(client, ref, output_dir)
+            except Exception as exc:
+                resolved = Resolution(
+                    id=int(ref["id"]),
+                    category=category_for(int(ref["id"])),
+                    requested_title=str(ref["title"]),
+                    requested_year=ref.get("year"),
+                    resolved_title=str(ref["title"]),
+                    doi=str(ref.get("doi") or ""),
+                    status="processing_error",
+                    note=f"{type(exc).__name__}: {exc}",
+                )
+            resolutions.append(resolved)
+            emit(f"    -> {resolved.status}; DOI={resolved.doi or 'unresolved'}")
+            time.sleep(0.08)
+
+        write_outputs(output_dir, resolutions)
+        downloaded = sum(item.status == "downloaded" for item in resolutions)
+        emit(f"Completed: {downloaded} PDFs downloaded; {len(resolutions) - downloaded} not downloaded")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

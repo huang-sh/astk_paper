@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Resolve a curated bibliography and download legally open-access PDFs.
+
+The script does not bypass paywalls, authentication, robots controls, or access
+restrictions. It queries public scholarly metadata services and downloads only
+PDFs exposed through open-access locations or public full-text repositories.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import time
+import unicodedata
+from dataclasses import dataclass, asdict
+from difflib import SequenceMatcher
+from pathlib import Path
+from typing import Any, Iterable
+from urllib.parse import quote
+
+import requests
+
+USER_AGENT = (
+    "PhD-literature-bundler/1.0 "
+    "(open-access metadata retrieval; contact: hsh-me@outlook.com)"
+)
+TIMEOUT = 50
+MAX_PDF_BYTES = 150 * 1024 * 1024
+
+CATEGORY_RANGES = [
+    (1, 6, "01_review_methodology"),
+    (7, 18, "02_bioinformatics_history"),
+    (19, 44, "03_databases_ontologies_FAIR"),
+    (45, 63, "04_CLI_algorithms"),
+    (64, 87, "05_libraries_packages_ecosystems"),
+    (88, 104, "06_GUI_visualization_HCI"),
+    (105, 121, "07_web_servers_APIs_platforms"),
+    (122, 156, "08_workflows_containers_reproducibility"),
+    (157, 175, "09_deep_learning_foundation_models"),
+    (176, 197, "10_LLM_biomedical_agents"),
+    (198, 211, "11_cognition_automation_theory"),
+]
+
+
+def category_for(ref_id: int) -> str:
+    for lo, hi, name in CATEGORY_RANGES:
+        if lo <= ref_id <= hi:
+            return name
+    return "99_other"
+
+
+def norm_text(value: str | None) -> str:
+    if not value:
+        return ""
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = value.replace("–", "-").replace("—", "-").replace("’", "'")
+    value = re.sub(r"[^a-zA-Z0-9]+", " ", value.lower()).strip()
+    return re.sub(r"\s+", " ", value)
+
+
+def title_similarity(a: str, b: str) -> float:
+    na, nb = norm_text(a), norm_text(b)
+    if not na or not nb:
+        return 0.0
+    if na == nb:
+        return 1.0
+    return SequenceMatcher(None, na, nb).ratio()
+
+
+def safe_filename(text: str, max_len: int = 105) -> str:
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"[^A-Za-z0-9._-]+", "_", text).strip("._-")
+    text = re.sub(r"_+", "_", text)
+    return (text[:max_len] or "paper").rstrip("._-")
+
+
+def first_author_from_crossref(item: dict[str, Any]) -> str:
+    authors = item.get("author") or []
+    if authors:
+        return authors[0].get("family") or authors[0].get("name") or "Unknown"
+    return "Unknown"
+
+
+def crossref_year(item: dict[str, Any]) -> int | None:
+    for key in ("published-print", "published-online", "published", "issued", "created"):
+        parts = ((item.get(key) or {}).get("date-parts") or [])
+        if parts and parts[0]:
+            try:
+                return int(parts[0][0])
+            except Exception:
+                pass
+    return None
+
+
+class HTTPClient:
+    def __init__(self) -> None:
+        self.session = requests.Session()
+        self.session.headers.update(
+            {
+                "User-Agent": USER_AGENT,
+                "Accept-Encoding": "gzip, deflate",
+            }
+        )
+
+    def get(self, url: str, *, params: dict[str, Any] | None = None, stream: bool = False,
+            accept: str | None = None, attempts: int = 4) -> requests.Response | None:
+        headers = {"Accept": accept} if accept else None
+        for attempt in range(attempts):
+            try:
+                response = self.session.get(
+                    url,
+                    params=params,
+                    timeout=TIMEOUT,
+                    allow_redirects=True,
+                    stream=stream,
+                    headers=headers,
+                )
+                if response.status_code == 429 or 500 <= response.status_code < 600:
+                    wait = min(20, 2 ** attempt + 0.5)
+                    response.close()
+                    time.sleep(wait)
+                    continue
+                return response
+            except requests.RequestException:
+                if attempt + 1 == attempts:
+                    return None
+                time.sleep(min(20, 2 ** attempt + 0.5))
+        return None
+
+    def json(self, url: str, *, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        response = self.get(url, params=params, accept="application/json")
+        if response is None:
+            return None
+        try:
+            if response.status_code != 200:
+                return None
+            return response.json()
+        except (ValueError, requests.RequestException):
+            return None
+        finally:
+            response.close()
+
+
+@dataclass
+class Resolution:
+    id: int
+    category: str
+    requested_title: str
+    requested_year: int | None
+    resolved_title: str = ""
+    resolved_year: int | None = None
+    doi: str = ""
+    first_author: str = "Unknown"
+    journal: str = ""
+    match_score: float = 0.0
+    metadata_source: str = ""
+    open_access: bool = False
+    oa_status: str = ""
+    pdf_url: str = ""
+    landing_url: str = ""
+    pdf_filename: str = ""
+    status: str = "not_downloaded"
+    note: str = ""
+
+
+def query_crossref(client: HTTPClient, title: str, year: int | None, explicit_doi: str) -> tuple[dict[str, Any] | None, float]:
+    if explicit_doi:
+        data = client.jso

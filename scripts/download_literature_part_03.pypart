@@ -1,0 +1,121 @@
+open" in availability or "free" in availability):
+            add_candidate(candidates, url, "Europe PMC full-text link")
+    if pmcid and is_oa:
+        add_candidate(candidates, f"https://europepmc.org/articles/{pmcid}?pdf=render", "Europe PMC OA repository")
+        add_candidate(candidates, f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/", "PubMed Central OA repository")
+        if not landing:
+            landing = f"https://europepmc.org/article/PMC/{pmcid.replace('PMC', '')}"
+    return candidates, pmcid, landing
+
+
+def crossref_oa_candidates(item: dict[str, Any] | None, known_oa: bool) -> list[tuple[str, str]]:
+    candidates: list[tuple[str, str]] = []
+    if not item or not known_oa:
+        return candidates
+    for link in item.get("link") or []:
+        if not isinstance(link, dict):
+            continue
+        content_type = str(link.get("content-type") or "").lower()
+        if "pdf" in content_type:
+            add_candidate(candidates, link.get("URL"), "Crossref publisher PDF (OA work)")
+    return candidates
+
+
+def download_pdf(client: HTTPClient, candidates: Iterable[tuple[str, str]], destination: Path) -> tuple[bool, str, str]:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    errors: list[str] = []
+    for url, source in candidates:
+        response = client.get(url, stream=True, accept="application/pdf,text/html;q=0.5,*/*;q=0.1")
+        if response is None:
+            errors.append(f"{source}: request failed")
+            continue
+        try:
+            if response.status_code != 200:
+                errors.append(f"{source}: HTTP {response.status_code}")
+                continue
+            tmp = destination.with_suffix(".part")
+            total = 0
+            head = b""
+            with tmp.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=128 * 1024):
+                    if not chunk:
+                        continue
+                    if len(head) < 2048:
+                        head += chunk[: 2048 - len(head)]
+                    total += len(chunk)
+                    if total > MAX_PDF_BYTES:
+                        raise RuntimeError("file exceeded 150 MB limit")
+                    handle.write(chunk)
+            if b"%PDF-" not in head[:2048]:
+                tmp.unlink(missing_ok=True)
+                content_type = response.headers.get("Content-Type", "")
+                errors.append(f"{source}: not a PDF ({content_type})")
+                continue
+            if total < 1024:
+                tmp.unlink(missing_ok=True)
+                errors.append(f"{source}: PDF too small")
+                continue
+            tmp.replace(destination)
+            return True, url, source
+        except Exception as exc:
+            destination.with_suffix(".part").unlink(missing_ok=True)
+            errors.append(f"{source}: {exc}")
+        finally:
+            response.close()
+    return False, "", "; ".join(errors[-4:])
+
+
+def resolve_one(client: HTTPClient, ref: dict[str, Any], output_dir: Path) -> Resolution:
+    ref_id = int(ref["id"])
+    title = str(ref["title"]).strip()
+    year = ref.get("year")
+    explicit_doi = str(ref.get("doi") or "").strip().lower()
+    result = Resolution(
+        id=ref_id,
+        category=category_for(ref_id),
+        requested_title=title,
+        requested_year=year,
+    )
+
+    crossref, cr_score = query_crossref(client, title, year, explicit_doi)
+    if crossref and (explicit_doi or cr_score >= 0.76):
+        result.resolved_title = ((crossref.get("title") or [title])[0])
+        result.resolved_year = crossref_year(item) or year
+        result.doi = str(crossref.get("DOI") or explicit_doi).lower()
+        result.first_author = first_author_from_crossref(crossref)
+        result.journal = ((crossref.get("container-title") or [""])[0])
+        result.match_score = round(cr_score, 4)
+        result.metadata_source = "Crossref"
+        result.landing_url = crossref.get("URL") or (f"https://doi.org/{result.doi}" if result.doi else "")
+    else:
+        result.resolved_title = title
+        result.resolved_year = year
+        result.doi = explicit_doi
+        result.match_score = round(cr_score, 4)
+
+    openalex, oa_score = query_openalex(client, title, year, result.doi)
+    if openalex and (result.doi or oa_score >= 0.78):
+        if not result.doi:
+            doi_url = openalex.get("doi") or ""
+            result.doi = doi_url.replace("https://doi.org/", "").lower()
+        if result.metadata_source == "":
+            result.resolved_title = openalex.get("title") or title
+            result.resolved_year = openalex.get("publication_year") or year
+            authorships = openalex.get("authorships") or []
+            if authorships:
+                result.first_author = (((authorships[0].get("author") or {}).get("display_name")) or "Unknown").split()[-1]
+            result.match_score = round(oa_score, 4)
+            result.metadata_source = "OpenAlex"
+
+    europe = query_europepmc(client, title, result.doi)
+    if europe:
+        if not result.doi and europe.get("doi"):
+            result.doi = str(europe["doi"]).lower()
+        if not result.resolved_title or result.resolved_title == title:
+            result.resolved_title = europe.get("title") or result.resolved_title
+        if not result.resolved_year:
+            try:
+                result.resolved_year = int(europe.get("pubYear"))
+            except Exception:
+                pass
+        if result.first_author == "Unknow

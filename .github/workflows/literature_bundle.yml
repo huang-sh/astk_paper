@@ -1,0 +1,46 @@
+name: Build open-access PhD literature bundle
+
+on:
+  push:
+    branches:
+      - chatgpt-literature-bundle-20260926
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade requests
+
+      - name: Assemble reference input and download script
+        run: |
+          cat data/references_part_*.jsonpart > data/references.json
+          cat scripts/download_literature_part_*.pypart > scripts/download_literature.py
+
+      - name: Resolve references and download open-access PDFs
+        run: python scripts/download_literature.py --input data/references.json --output bundle
+
+      - name: Add original compact reference input
+        run: cp data/references.json bundle/requested_references.json
+
+      - name: Upload literature bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhD_Part1_literature_bundle
+          path: bundle/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6

@@ -1,0 +1,131 @@
+n(f"https://api.crossref.org/works/{quote(explicit_doi, safe='')}")
+        item = (data or {}).get("message")
+        if isinstance(item, dict):
+            candidate_title = ((item.get("title") or [""])[0])
+            return item, title_similarity(title, candidate_title)
+
+    params: dict[str, Any] = {
+        "query.bibliographic": title,
+        "rows": 5,
+        "select": "DOI,title,author,published,published-print,published-online,issued,created,container-title,type,URL,link,license",
+    }
+    data = client.json("https://api.crossref.org/works", params=params)
+    items = (((data or {}).get("message") or {}).get("items") or [])
+    best: tuple[float, dict[str, Any] | None] = (0.0, None)
+    for item in items:
+        cand_title = ((item.get("title") or [""])[0])
+        score = title_similarity(title, cand_title)
+        cyear = crossref_year(item)
+        if year and cyear:
+            if cyear == year:
+                score += 0.04
+            elif abs(cyear - year) > 1:
+                score -= 0.08
+        if score > best[0]:
+            best = (score, item)
+    return best[1], min(best[0], 1.0)
+
+
+def query_openalex(client: HTTPClient, title: str, year: int | None, doi: str) -> tuple[dict[str, Any] | None, float]:
+    if doi:
+        url = f"https://api.openalex.org/works/https://doi.org/{quote(doi, safe='/') }"
+        data = client.json(url, params={"mailto": "hsh-me@outlook.com"})
+        if data and data.get("id"):
+            return data, title_similarity(title, data.get("title") or "")
+
+    data = client.json(
+        "https://api.openalex.org/works",
+        params={
+            "search": title,
+            "per-page": 5,
+            "mailto": "hsh-me@outlook.com",
+        },
+    )
+    best: tuple[float, dict[str, Any] | None] = (0.0, None)
+    for item in (data or {}).get("results") or []:
+        score = title_similarity(title, item.get("title") or "")
+        cyear = item.get("publication_year")
+        if year and cyear:
+            if int(cyear) == year:
+                score += 0.04
+            elif abs(int(cyear) - year) > 1:
+                score -= 0.08
+        if score > best[0]:
+            best = (score, item)
+    return best[1], min(best[0], 1.0)
+
+
+def query_europepmc(client: HTTPClient, title: str, doi: str) -> dict[str, Any] | None:
+    query = f'DOI:"{doi}"' if doi else f'TITLE:"{title}"'
+    data = client.json(
+        "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+        params={"query": query, "format": "json", "pageSize": 10, "resultType": "core"},
+    )
+    results = (((data or {}).get("resultList") or {}).get("result") or [])
+    if not results and doi:
+        data = client.json(
+            "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+            params={"query": f'EXT_ID:"{doi}"', "format": "json", "pageSize": 10, "resultType": "core"},
+        )
+        results = (((data or {}).get("resultList") or {}).get("result") or [])
+    best: tuple[float, dict[str, Any] | None] = (0.0, None)
+    for item in results:
+        score = title_similarity(title, item.get("title") or "")
+        if score > best[0]:
+            best = (score, item)
+    return best[1] if best[0] >= 0.72 else None
+
+
+def add_candidate(candidates: list[tuple[str, str]], url: str | None, source: str) -> None:
+    if not url or not url.startswith(("http://", "https://")):
+        return
+    normalized = url.replace("http://", "https://", 1) if url.startswith("http://") else url
+    if all(existing != normalized for existing, _ in candidates):
+        candidates.append((normalized, source))
+
+
+def openalex_candidates(work: dict[str, Any] | None) -> tuple[list[tuple[str, str]], bool, str, str]:
+    candidates: list[tuple[str, str]] = []
+    if not work:
+        return candidates, False, "", ""
+    oa = work.get("open_access") or {}
+    is_oa = bool(oa.get("is_oa"))
+    oa_status = oa.get("oa_status") or ""
+    landing = ""
+    locations: list[dict[str, Any]] = []
+    if work.get("best_oa_location"):
+        locations.append(work["best_oa_location"])
+    locations.extend(work.get("locations") or [])
+    seen_ids: set[str] = set()
+    for loc in locations:
+        if not isinstance(loc, dict):
+            continue
+        loc_key = str(loc.get("id") or loc.get("landing_page_url") or loc.get("pdf_url") or "")
+        if loc_key in seen_ids:
+            continue
+        seen_ids.add(loc_key)
+        if not landing and loc.get("landing_page_url"):
+            landing = loc["landing_page_url"]
+        # OpenAlex exposes pdf_url only for known locations. Restrict downloads to OA works/locations.
+        if is_oa or loc.get("is_oa"):
+            add_candidate(candidates, loc.get("pdf_url"), "OpenAlex OA location")
+    return candidates, is_oa, oa_status, landing
+
+
+def europepmc_candidates(item: dict[str, Any] | None) -> tuple[list[tuple[str, str]], str, str]:
+    candidates: list[tuple[str, str]] = []
+    if not item:
+        return candidates, "", ""
+    landing = ""
+    pmcid = item.get("pmcid") or ""
+    is_oa = str(item.get("isOpenAccess") or "").upper() == "Y"
+    urls = (((item.get("fullTextUrlList") or {}).get("fullTextUrl")) or [])
+    for entry in urls:
+        if not isinstance(entry, dict):
+            continue
+        url = entry.get("url")
+        style = str(entry.get("documentStyle") or "").lower()
+        availability = str(entry.get("availability") or "").lower()
+        if not landing and url:
+            landing = url
+        if style == "pdf" and (is_oa or "
