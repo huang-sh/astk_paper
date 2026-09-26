@@ -46,6 +46,7 @@ jobs:
           print(f'Validated {len(refs)} unique references')
           PY
           python -m py_compile scripts/download_literature.py
+          python -m py_compile scripts/recover_oa_pdfs.py
           python - <<'PY'
           import json
           from pathlib import Path
@@ -182,6 +183,9 @@ jobs:
           (out / 'README.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
           print(f'Merged {len(rows)} records: {len(downloaded)} PDFs, {len(unavailable)} unavailable')
           PY
+
+      - name: Recover additional open-access PDFs
+        run: python scripts/recover_oa_pdfs.py bundle
 
       - name: Add requested bibliography
         run: cp data/references.json bundle/requested_references.json
