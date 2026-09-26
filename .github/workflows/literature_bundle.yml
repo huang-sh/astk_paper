@@ -29,6 +29,8 @@ jobs:
         run: |
           cat data/references_part_*.jsonpart > data/references.json
           cat scripts/download_literature_part_*.pypart > scripts/download_literature.py
+          sed -i "s/{author'}/{author}/g" scripts/download_literature.py
+          python -m py_compile scripts/download_literature.py
 
       - name: Resolve references and download open-access PDFs
         run: python scripts/download_literature.py --input data/references.json --output bundle
