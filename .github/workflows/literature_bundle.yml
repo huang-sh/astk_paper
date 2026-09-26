@@ -25,132 +25,25 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade requests
 
-      - name: Assemble inputs and strengthen OA retrieval
+      - name: Assemble and validate inputs
         run: |
           cat data/references_part_*.jsonpart > data/references.json
           cat scripts/download_literature_part_*.pypart > scripts/download_literature.py
+          sed -i "s/{author'}/{author}/g" scripts/download_literature.py
+          sed -i 's/crossref_year(item) or year/crossref_year(crossref) or year/' scripts/download_literature.py
+          sed -i 's/TIMEOUT = 50/TIMEOUT = 25/' scripts/download_literature.py
+          sed -i 's/attempts: int = 4/attempts: int = 3/' scripts/download_literature.py
           python - <<'PY'
           import json
           from pathlib import Path
-
-          refs_path = Path('data/references.json')
-          refs = json.loads(refs_path.read_text(encoding='utf-8'))
-          # One chunk boundary introduced a duplicate/corrupt ID 58 record. Keep the later,
-          # complete entry and enforce the intended 1..211 bibliography.
+          path = Path('data/references.json')
+          refs = json.loads(path.read_text(encoding='utf-8'))
           dedup = {int(ref['id']): ref for ref in refs}
           refs = [dedup[i] for i in sorted(dedup)]
-          assert len(refs) == 211 and [r['id'] for r in refs] == list(range(1, 212))
-          refs_path.write_text(json.dumps(refs, ensure_ascii=False), encoding='utf-8')
-
-          script_path = Path('scripts/download_literature.py')
-          script = script_path.read_text(encoding='utf-8')
-          script = script.replace("{author'}", "{author}")
-          script = script.replace('crossref_year(item) or year', 'crossref_year(crossref) or year')
-          script = script.replace('TIMEOUT = 50', 'TIMEOUT = 25')
-          script = script.replace('attempts: int = 4', 'attempts: int = 3')
-
-          helper_anchor = '\n\ndef download_pdf('
-          assert helper_anchor in script
-          helper = r'''
-
-def unpaywall_candidates(client: HTTPClient, doi: str) -> tuple[list[tuple[str, str]], str, str]:
-    candidates: list[tuple[str, str]] = []
-    if not doi:
-        return candidates, "", ""
-    data = client.json(
-        f"https://api.unpaywall.org/v2/{quote(doi, safe='/')}",
-        params={"email": "hsh-me@outlook.com"},
-    )
-    if not data or not data.get("is_oa"):
-        return candidates, "", ""
-    oa_status = str(data.get("oa_status") or "")
-    landing = ""
-    locations: list[dict[str, Any]] = []
-    if isinstance(data.get("best_oa_location"), dict):
-        locations.append(data["best_oa_location"])
-    locations.extend(loc for loc in (data.get("oa_locations") or []) if isinstance(loc, dict))
-    seen: set[str] = set()
-    for loc in locations:
-        key = str(loc.get("url_for_pdf") or loc.get("url") or "")
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        if not landing and loc.get("url"):
-            landing = str(loc["url"])
-        add_candidate(candidates, loc.get("url_for_pdf"), "Unpaywall OA location")
-    return candidates, oa_status, landing
-
-
-def pmc_oa_pdf_candidate(client: HTTPClient, pmcid: str) -> str:
-    if not pmcid:
-        return ""
-    import xml.etree.ElementTree as ET
-    response = client.get(
-        "https://www.ncbi.nlm.nih.gov/pmc/utils/oa/oa.fcgi",
-        params={"id": pmcid},
-        accept="application/xml,text/xml;q=0.9,*/*;q=0.1",
-    )
-    if response is None:
-        return ""
-    try:
-        if response.status_code != 200:
-            return ""
-        root = ET.fromstring(response.content)
-        for link in root.findall('.//link'):
-            if str(link.attrib.get('format') or '').lower() != 'pdf':
-                continue
-            href = str(link.attrib.get('href') or '')
-            if href.startswith('ftp://ftp.ncbi.nlm.nih.gov/'):
-                href = 'https://ftp.ncbi.nlm.nih.gov/' + href.split('ftp://ftp.ncbi.nlm.nih.gov/', 1)[1]
-            if href.startswith(('http://', 'https://')):
-                return href
-    except Exception:
-        return ""
-    finally:
-        response.close()
-    return ""
-'''
-          script = script.replace(helper_anchor, helper + helper_anchor, 1)
-
-          old_block = '''    candidates, is_oa, oa_status, oa_landing = openalex_candidates(openalex)
-    epmc_candidates, pmcid, epmc_landing = europepmc_candidates(europe)
-    candidates.extend(c for c in epmc_candidates if c not in candidates)
-    known_oa = is_oa or bool(epmc_candidates)
-    candidates.extend(c for c in crossref_oa_candidates(crossref, known_oa) if c not in candidates)
-    result.open_access = known_oa
-    result.oa_status = oa_status or ("repository" if pmcid else "")
-    if oa_landing:
-        result.landing_url = oa_landing
-    elif epmc_landing:
-        result.landing_url = epmc_landing
-    elif result.doi and not result.landing_url:
-        result.landing_url = f"https://doi.org/{result.doi}"
-'''
-          new_block = '''    candidates, is_oa, oa_status, oa_landing = openalex_candidates(openalex)
-    upw_candidates, upw_status, upw_landing = unpaywall_candidates(client, result.doi)
-    candidates.extend(c for c in upw_candidates if c not in candidates)
-    epmc_candidates, pmcid, epmc_landing = europepmc_candidates(europe)
-    candidates.extend(c for c in epmc_candidates if c not in candidates)
-    pmc_pdf = pmc_oa_pdf_candidate(client, pmcid)
-    if pmc_pdf:
-        add_candidate(candidates, pmc_pdf, "PMC Open Access PDF package")
-    known_oa = is_oa or bool(upw_candidates) or bool(epmc_candidates) or bool(pmc_pdf)
-    candidates.extend(c for c in crossref_oa_candidates(crossref, known_oa) if c not in candidates)
-    result.open_access = known_oa
-    result.oa_status = oa_status or upw_status or ("repository" if pmcid else "")
-    if oa_landing:
-        result.landing_url = oa_landing
-    elif upw_landing:
-        result.landing_url = upw_landing
-    elif epmc_landing:
-        result.landing_url = epmc_landing
-    elif result.doi and not result.landing_url:
-        result.landing_url = f"https://doi.org/{result.doi}"
-'''
-          assert old_block in script
-          script = script.replace(old_block, new_block, 1)
-          script_path.write_text(script, encoding='utf-8')
-          print(f'Validated {len(refs)} unique references and patched OA retrieval')
+          assert len(refs) == 211
+          assert [int(ref['id']) for ref in refs] == list(range(1, 212))
+          path.write_text(json.dumps(refs, ensure_ascii=False), encoding='utf-8')
+          print(f'Validated {len(refs)} unique references')
           PY
           python -m py_compile scripts/download_literature.py
           python - <<'PY'
