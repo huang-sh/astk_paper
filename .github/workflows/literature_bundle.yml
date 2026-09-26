@@ -12,7 +12,7 @@ permissions:
 jobs:
   build-bundle:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 120
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -25,17 +25,151 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --upgrade requests
 
-      - name: Assemble reference input and download script
+      - name: Assemble inputs and validate downloader
         run: |
           cat data/references_part_*.jsonpart > data/references.json
           cat scripts/download_literature_part_*.pypart > scripts/download_literature.py
           sed -i "s/{author'}/{author}/g" scripts/download_literature.py
+          sed -i 's/TIMEOUT = 50/TIMEOUT = 25/' scripts/download_literature.py
+          sed -i 's/attempts: int = 4/attempts: int = 3/' scripts/download_literature.py
           python -m py_compile scripts/download_literature.py
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          refs = json.loads(Path('data/references.json').read_text(encoding='utf-8'))
+          shards = 6
+          for i in range(shards):
+              Path(f'data/shard_{i}.json').write_text(
+                  json.dumps(refs[i::shards], ensure_ascii=False), encoding='utf-8'
+              )
+          print(f'Split {len(refs)} references into {shards} shards')
+          PY
 
-      - name: Resolve references and download open-access PDFs
-        run: python scripts/download_literature.py --input data/references.json --output bundle
+      - name: Resolve references and download open-access PDFs in parallel
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p bundle_parts
+          pids=()
+          for f in data/shard_*.json; do
+            n="${f##*_}"
+            n="${n%.json}"
+            python scripts/download_literature.py \
+              --input "$f" \
+              --output "bundle_parts/shard_${n}" \
+              > "bundle_parts/shard_${n}.runner.log" 2>&1 &
+            pids+=("$!")
+          done
+          rc=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || rc=1
+          done
+          if [ "$rc" -ne 0 ]; then
+            echo 'At least one shard failed.'
+            for f in bundle_parts/*.runner.log; do
+              echo "===== $f ====="
+              tail -100 "$f" || true
+            done
+            exit 1
+          fi
 
-      - name: Add original compact reference input
+      - name: Merge shard outputs
+        run: |
+          python - <<'PY'
+          import csv
+          import json
+          import shutil
+          from pathlib import Path
+
+          root = Path('bundle_parts')
+          out = Path('bundle')
+          out.mkdir(parents=True, exist_ok=True)
+          rows = []
+          metadata = []
+          fieldnames = None
+          logs = []
+
+          parts = sorted(p for p in root.glob('shard_*') if p.is_dir())
+          for part in parts:
+              pdfs = part / 'pdfs'
+              if pdfs.exists():
+                  shutil.copytree(pdfs, out / 'pdfs', dirs_exist_ok=True)
+              table = part / 'all_references_resolved.csv'
+              if table.exists():
+                  with table.open(encoding='utf-8-sig', newline='') as handle:
+                      reader = csv.DictReader(handle)
+                      if fieldnames is None:
+                          fieldnames = reader.fieldnames
+                      rows.extend(reader)
+              meta = part / 'resolved_metadata.json'
+              if meta.exists():
+                  metadata.extend(json.loads(meta.read_text(encoding='utf-8')))
+              log = part / 'download_log.txt'
+              if log.exists():
+                  logs.append(f'===== {part.name}/download_log.txt =====\n' + log.read_text(encoding='utf-8', errors='replace'))
+              runner_log = root / f'{part.name}.runner.log'
+              if runner_log.exists():
+                  logs.append(f'===== {runner_log.name} =====\n' + runner_log.read_text(encoding='utf-8', errors='replace'))
+
+          rows.sort(key=lambda row: int(row['id']))
+          metadata.sort(key=lambda row: int(row['id']))
+          fieldnames = fieldnames or []
+          with (out / 'all_references_resolved.csv').open('w', encoding='utf-8-sig', newline='') as handle:
+              writer = csv.DictWriter(handle, fieldnames=fieldnames)
+              writer.writeheader()
+              writer.writerows(rows)
+
+          unavailable = [row for row in rows if row.get('status') != 'downloaded']
+          with (out / 'unavailable_title_doi.csv').open('w', encoding='utf-8-sig', newline='') as handle:
+              writer = csv.writer(handle)
+              writer.writerow(['id', 'title', 'doi', 'status', 'reason', 'landing_url'])
+              for row in unavailable:
+                  writer.writerow([
+                      row.get('id', ''),
+                      row.get('resolved_title') or row.get('requested_title', ''),
+                      row.get('doi') or 'DOI not resolved',
+                      row.get('status', ''),
+                      row.get('note', ''),
+                      row.get('landing_url', ''),
+                  ])
+
+          (out / 'resolved_metadata.json').write_text(
+              json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          (out / 'download_log.txt').write_text('\n\n'.join(logs) + '\n', encoding='utf-8')
+
+          downloaded = [row for row in rows if row.get('status') == 'downloaded']
+          lines = [
+              '# PhD Part I literature bundle',
+              '',
+              f'- Requested references: **{len(rows)}**',
+              f'- Open-access PDFs downloaded: **{len(downloaded)}**',
+              f'- Not downloaded: **{len(unavailable)}**',
+              '',
+              'Only openly accessible copies were downloaded. The workflow did not bypass paywalls, authentication, robots controls, or publisher access restrictions.',
+              '',
+              '## Contents',
+              '',
+              '- `pdfs/`: downloaded PDFs grouped by thesis topic.',
+              '- `all_references_resolved.csv`: complete metadata and retrieval status.',
+              '- `unavailable_title_doi.csv`: title and DOI (when resolved) for every item without a downloaded PDF.',
+              '- `resolved_metadata.json`: machine-readable metadata.',
+              '- `download_log.txt`: combined diagnostic log.',
+              '- `requested_references.json`: the requested 211-item bibliography.',
+              '',
+              '## Downloaded papers',
+              '',
+          ]
+          for row in downloaded:
+              lines.append(f"- {row['id']}. {row.get('resolved_title') or row.get('requested_title')} — DOI: {row.get('doi') or 'not resolved'} — `{row.get('pdf_filename')}`")
+          lines.extend(['', '## Not downloaded', ''])
+          for row in unavailable:
+              lines.append(f"- {row['id']}. {row.get('resolved_title') or row.get('requested_title')} — DOI: {row.get('doi') or 'not resolved'} — {row.get('status')}")
+          (out / 'README.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          print(f'Merged {len(rows)} records: {len(downloaded)} PDFs, {len(unavailable)} unavailable')
+          PY
+
+      - name: Add requested bibliography
         run: cp data/references.json bundle/requested_references.json
 
       - name: Upload literature bundle
